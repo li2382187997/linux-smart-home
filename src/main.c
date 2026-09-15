@@ -137,9 +137,10 @@ static void fill_rect(unsigned char *fb, int x, int y, int w, int h, unsigned in
         }
 }
 
-/* ================= 个人信息（首页左上方） ================= */
+/* ================= 组名信息（首页左上方） ================= */
 static void draw_group_info(void) {
     font_show("李雅洁", 36, 200, 50, 0x00000000, 10, 5, 0xFFFFFFFF, 20, 20);
+   
 }
 
 /* ================= LED / 串口 ================= */
@@ -330,7 +331,7 @@ void light_run(void) {
 static void voice_page(void) {
     show_24bmp("ybj.bmp", 0, 0);
     draw_back();
-    font_show("请点击麦克风开始语音控制", 28, 700, 40, 0xFFFFFFFF, 10, 8, 0xFF000000, 50, 130);
+    font_show("点击麦克风开始语音控制", 28, 700, 40, 0xFFFFFFFF, 10, 8, 0xFF000000, 50, 130);
 }
 
 void ai_voice(int sockfd) {
@@ -345,24 +346,31 @@ void ai_voice(int sockfd) {
         cmd = get_voice_info(sockfd);
         if (cmd == 999) return;
         if (cmd == 2) {
-            font_show("你好！", 32, 700, 300, 0xFFFFFF00, 10, 80, 0xFF000000, 36, 26);
+            font_show("你好!", 32, 700, 300, 0xFFFFFF00, 10, 80, 0xFF000000, 36, 26);
             system("aplay -q /ai_wav/nihao.wav &");
         } else if (cmd == 3 || cmd == 6) {
-            font_show("请将手指放在传感器上，等待一段时间", 32, 700, 300, 0xFFFFFF00, 10, 80, 0xFF000000, 36, 26);
+            font_show("请把手放到传感器，等待一会", 32, 700, 300, 0xFFFFFF00, 10, 80, 0xFF000000, 36, 26);
             if (cmd == 3) {
                 system("aplay -q /ai_wav/dengdai.wav");
                 value = get_stm32_data("mks-sbp\n");
-                snprintf(s, sizeof(s), value <= 0 ? "测量失败，请再试一次" : value <= 139 ? "您好，血压正常，继续保持" : "您好，血压偏高，注意身体");
+                snprintf(s, sizeof(s), value <= 0 ? "测量失败，请重试" : value <= 139 ? "血压正常，继续保持" : "血压偏高，请注意");
             } else {
                 value = get_stm32_data("mks-hr\n");
-                snprintf(s, sizeof(s), value > 0 ? "您的心率：%d" : "测量失败，请再试一次", value);
+                snprintf(s, sizeof(s), value > 0 ? "心率：%d" : "测量失败，请重试", value);
             }
             font_show(s, 32, 700, 300, 0xFFFFFF00, 10, 80, 0xFF000000, 36, 26);
         } else if (cmd == 100) {
             value = send_led(0, 1) && send_led(1, 1) && send_led(2, 1);
-            font_show(value ? "灯光已全部打开！" : "对不起，灯光打开失败", 32, 700, 300, 0xFFFFFF00, 10, 80, 0xFF000000, 36, 26);
-        } else {
-            font_show("抱歉，我好像没听懂，请再说一遍", 32, 700, 300, 0xFFFFFF00, 10, 80, 0xFF000000, 36, 26);
+            font_show(value ? "灯光已全部打开" : "灯光控制失败", 32, 700, 300, 0xFFFFFF00, 10, 80, 0xFF000000, 36, 26);
+        }else if (cmd == 4) {   // ★ 打开相册：进入相册循环，点返回后回到语音界面
+            font_show("好的，打开相册", 32, 700, 300, 0xFFFFFF00, 10, 80, 0xFF000000, 36, 26);
+            gallery_run();        // 阻塞在相册内，return 后回到本循环的下一轮等待语音
+        } else if (cmd == 5) {   // ★ 打开留言板
+            font_show("好的，打开留言板", 32, 700, 300, 0xFFFFFF00, 10, 80, 0xFF000000, 36, 26);
+            recorder_run();
+        }
+        else {
+            font_show("我好像没听懂，请再说一遍", 32, 700, 300, 0xFFFFFF00, 10, 80, 0xFF000000, 36, 26);
         }
     }
 }
@@ -384,7 +392,7 @@ int get_stm32_data(char *cmd) {
 int get_voice_info(int sockfd) {
     xmlChar *id;
     int n;
-    font_show("我在听，请说", 32, 700, 300, 0xFFFFFF00, 10, 80, 0xFF000000, 36, 26);
+    font_show("我在听，请说出你的需求", 32, 700, 300, 0xFFFFFF00, 10, 80, 0xFF000000, 36, 26);
     if (system(REC_CMD)) return 0;
     send_pcm(sockfd, "./cmd.pcm");
     id = wait4id(sockfd);
