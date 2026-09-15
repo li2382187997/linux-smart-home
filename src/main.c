@@ -1,422 +1,692 @@
-#include "common.h"
-#include <poll.h>
-#include <sys/time.h>
-#include <unistd.h>
-#include <sys/mman.h>
+/*
+ * 智能家居中控终端 —— 应用层主程序
+ *
+ * 编译依赖：实训方 BSP（common.h / common.c，提供 lcd_init、ts_init、init_tty、
+ *           init_sock、get_xy、send_pcm、wait4id、fontLoad 等）与字体文件
+ * 运行依赖：/dev/fb0、/dev/ttySAC2、Ubuntu 语音识别服务、alsa-utils
+ */
+
+#define _POSIX_C_SOURCE 200809L
+
+#include <errno.h>
 #include <fcntl.h>
-#include <linux/input.h>
+#include <poll.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <time.h>
+#include <unistd.h>
 
-#define DEV_PATH2    "/dev/ttySAC2"
-#define REC_CMD      "arecord -q -d3 -c1 -r16000 -traw -fS16_LE ./cmd.pcm"
-#define REC_WAV_CMD  "arecord -q -d5 -c1 -r16000 -twav -fS16_LE ./record.wav"
-#define PLAY_WAV_CMD "aplay -q ./record.wav"
-#define LCD_W 800
-#define LCD_H 480
+#include "common.h"
 
-/* ================= 彩色 BMP（正确 BGR->ARGB, Alpha=0xFF） ================= */
+// 外部字库句柄
+extern font *f;
+extern char board_info[128];
+
+#define W 800
+#define H 480
+
+// 屏幕缓冲指针（由 lcd_init 提供）
 extern unsigned char *lcd;
 
-static void show_24bmp(const char *file, int x0, int y0) {
-    int fd = open(file, O_RDONLY);
-    if (fd < 0) return;
-    unsigned char header[54];
-    if (read(fd, header, 54) != 54) { close(fd); return; }
-    int w = *(int *)&header[18];
-    int h = *(int *)&header[22];
-    if (h < 0) h = -h;
-    int line_bytes = ((w * 3 + 3) / 4) * 4;
-    unsigned char *line = malloc(line_bytes);
-    if (!line) { close(fd); return; }
-    for (int y = 0; y < h; y++) {
-        if (read(fd, line, line_bytes) <= 0) break;
-        int fb_y = y0 + (h - 1 - y);
-        if (fb_y < 0 || fb_y >= LCD_H) continue;
-        for (int x = 0; x < w; x++) {
-            int fb_x = x0 + x;
-            if (fb_x < 0 || fb_x >= LCD_W) continue;
-            int idx = (fb_y * LCD_W + fb_x) * 4;
-            lcd[idx + 0] = line[x * 3 + 0];
-            lcd[idx + 1] = line[x * 3 + 1];
-            lcd[idx + 2] = line[x * 3 + 2];
-            lcd[idx + 3] = 0xFF;
-        }
-    }
-    free(line);
-    close(fd);
+#define CMD  "./recordcmd.sh"   // 录音脚本
+#define CMD1 "./myplay.sh"      // 播放脚本
+
+// ================== 小工具 ==================
+static void msleep(int ms)
+{
+    struct timespec ts = {0, (long)ms * 1000000L};
+    nanosleep(&ts, NULL);
 }
 
-/* ================= 全局变量 ================= */
-static char *pics[] = {"0720.bmp", "07.bmp", "06.bmp", "10.bmp"};
-#define PIC_N (sizeof(pics) / sizeof(pics[0]))
-
-int tty2_fd = -1;
-static int led[3];
-static int touch_nbio = -1, lock_x = -1, lock_y = -1;
-static font *g_font;
-
-void showbitmap(bitmap *bm, int x, int y);
-void font_show(char *s, int size, int w, int h, int bg, int fx, int fy,
-               int fg, int lx, int ly);
-void fontUnload(font *f);
-void serial_init(void);
-int get_stm32_data(char *cmd);
-int get_voice_info(int sockfd);
-void page_main(int sockfd);
-void gallery_run(void);
-void recorder_run(void);
-void light_run(void);
-void ai_voice(int sockfd);
-
-/* ================= 工具函数 ================= */
-static int in(int x, int y, int l, int t, int r, int b) {
-    return x >= l && x <= r && y >= t && y <= b;
+static unsigned int ts_ms(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (unsigned int)(t.tv_sec * 1000 + t.tv_nsec / 1000000);
 }
 
-static void lock_touch(int x, int y) { lock_x = x; lock_y = y; }
-
-static void read_touch(int *x, int *y) {
-    struct timeval a, b;
-    int tx, ty, ms;
-    for (;;) {
-        gettimeofday(&a, NULL);
-        get_xy(&tx, &ty);
-        gettimeofday(&b, NULL);
-        if (touch_nbio < 0) {
-            ms = (b.tv_sec - a.tv_sec) * 1000 + (b.tv_usec - a.tv_usec) / 1000;
-            touch_nbio = ms < 20;
-        }
-        if (tx < 0 || tx >= LCD_W || ty < 0 || ty >= LCD_H) { poll(NULL, 0, 20); continue; }
-        if (touch_nbio && lock_x >= 0 &&
-            tx >= lock_x - 24 && tx <= lock_x + 24 &&
-            ty >= lock_y - 24 && ty <= lock_y + 24) { poll(NULL, 0, 20); continue; }
-        lock_x = lock_y = -1;
-        *x = tx; *y = ty;
-        return;
-    }
-}
-
-static int back(int x, int y) { return in(x, y, 660, 10, 760, 70); }
-
-void draw_back(void) {
-    font_show("返回", 28, 100, 60, 0xFF888888, 10, 10, 0xFFFFFFFF, 660, 10);
-}
-
-static int wait_tap(int n, const int *rects, int *tx, int *ty) {
-    int x, y;
-    read_touch(&x, &y);
-    *tx = x; *ty = y;
-    if (back(x, y)) return -1;
-    for (int i = 0; i < n; ++i)
-        if (in(x, y, rects[4*i], rects[4*i+1], rects[4*i+2], rects[4*i+3]))
-            return i;
-    return -2;
-}
-
-static unsigned char *fb_mmap(int *fd_lcd) {
-    *fd_lcd = open("/dev/fb0", O_RDWR);
-    if (*fd_lcd < 0) return NULL;
-    unsigned char *p = mmap(NULL, LCD_W * LCD_H * 4, PROT_READ | PROT_WRITE, MAP_SHARED, *fd_lcd, 0);
-    if (p == MAP_FAILED) { close(*fd_lcd); return NULL; }
-    return p;
-}
-
-static void fb_unmap(unsigned char *fb, int fd_lcd) {
-    munmap(fb, LCD_W * LCD_H * 4);
-    close(fd_lcd);
-}
-
-static void fill_rect(unsigned char *fb, int x, int y, int w, int h, unsigned int color) {
-    for (int j = y; j < y + h; ++j)
-        for (int i = x; i < x + w; ++i) {
-            if (i < 0 || i >= LCD_W || j < 0 || j >= LCD_H) continue;
-            int idx = (j * LCD_W + i) * 4;
-            fb[idx + 0] = (color >>  0) & 0xFF;
-            fb[idx + 1] = (color >>  8) & 0xFF;
-            fb[idx + 2] = (color >> 16) & 0xFF;
-            fb[idx + 3] = (color >> 24) & 0xFF;
+// 纯色矩形
+static void draw_solid_rect(int x, int y, int w, int h, unsigned int color)
+{
+    for (int yy = 0; yy < h; yy++)
+        for (int xx = 0; xx < w; xx++)
+        {
+            int px = x + xx, py = y + yy;
+            if (px < 0 || py < 0 || px >= W || py >= H)
+                continue;
+            unsigned char *p = lcd + (py * W + px) * 4;
+            p[0] = color & 0xff;
+            p[1] = (color >> 8) & 0xff;
+            p[2] = (color >> 16) & 0xff;
+            p[3] = (color >> 24) & 0xff;
         }
 }
 
-/* ================= 组名信息（首页左上方） ================= */
-static void draw_group_info(void) {
-    font_show("小卷", 36, 200, 50, 0x00000000, 10, 5, 0xFFFFFFFF, 20, 20);
-   
+// 横线
+static void draw_hline(int x, int y, int w, unsigned int color)
+{
+    draw_solid_rect(x, y, w, 1, color);
 }
 
-/* ================= LED / 串口 ================= */
-static int send_led(int i, int on) {
-    char cmd[16];
-    snprintf(cmd, sizeof(cmd), "led%d-%s\n", i + 1, on ? "on" : "off");
-    if (write(tty2_fd, cmd, strlen(cmd)) < 0) return 0;
-    led[i] = on;
-    return 1;
+// 空心矩形边框
+static void draw_frame(int x, int y, int w, int h, unsigned int color)
+{
+    draw_hline(x, y, w, color);
+    draw_hline(x, y + h - 1, w, color);
+    draw_solid_rect(x, y, 1, h, color);
+    draw_solid_rect(x + w - 1, y, 1, h, color);
 }
 
-static int stm_query(char *cmd, int min) {
-    char buf[128] = {0};
-    int i, n;
-    if (write(tty2_fd, cmd, strlen(cmd)) < 0) return 0;
-    for (i = 0; i < 30; ++i) {
-        struct pollfd p = {tty2_fd, POLLIN, 0};
-        if (poll(&p, 1, 200) > 0 && (n = read(tty2_fd, buf, sizeof(buf) - 1)) > 0) {
-            buf[n] = '\0';
-            if (atoi(buf) > min) return atoi(buf);
+// 居中写字（返回实际宽度）
+static int draw_text_center(const char *text, int size, int cx, int y, unsigned int color)
+{
+    int width = W;
+    fontSetSize(f, size);
+    bitmap bm;
+    fontPrint(f, (unsigned char *)text, &bm, width, 0);
+    int leftplace = (cx - bm.width) / 2;
+    show_font(f, (unsigned char *)text, color, leftplace < 0 ? cx : leftplace, y);
+    return bm.width;
+}
+
+static void draw_text_left(const char *text, int size, int x, int y, unsigned int color)
+{
+    fontSetSize(f, size);
+    show_font(f, (unsigned char *)text, color, x, y);
+}
+
+// 进度条
+static void draw_progress(int x, int y, int w, int h, int perc,
+                          unsigned int bg, unsigned int fg)
+{
+    draw_solid_rect(x, y, w, h, bg);
+    draw_frame(x, y, w, h, 0xFFFFFFFF);
+    int inner = (w - 4) * perc / 100;
+    draw_solid_rect(x + 2, y + 2, inner, h - 4, fg);
+}
+
+// ================== 触摸去抖 ==================
+#define TOUCH_JITTER_MS 20  // 按下后 20 ms 内的采样视为抖动
+#define TOUCH_LOCK_DIST 24  // 位移小于此值（像素）视为同一次触摸
+
+static unsigned int last_down_ms = 0;
+static int last_down_x = -1, last_down_y = -1;
+
+// 读取一次稳定的触摸坐标：
+//   1) 首次读到点记为按下，记录时间与位置
+//   2) 之后持续采样，落在抖动窗口内且位移未超阈值的点丢弃
+//   3) 位置稳定或超过抖动窗口后才上报
+static void read_touch(int *x, int *y)
+{
+    int lx = 0, ly = 0;
+    for (;;)
+    {
+        get_xy(&lx, &ly);
+        unsigned int now = ts_ms();
+
+        if (last_down_x < 0)
+        {
+            last_down_x = lx;
+            last_down_y = ly;
+            last_down_ms = now;
+            continue;
         }
-    }
-    return 0;
-}
 
-/* ================= bitmap / font ================= */
-void showbitmap(bitmap *bm, int x0, int y0) {
-    int xs = x0 < 0 ? -x0 : 0, ys = y0 < 0 ? -y0 : 0;
-    int xe = bm->width, ye = bm->height;
-    if (x0 + xe > LCD_W) xe = LCD_W - x0;
-    if (y0 + ye > LCD_H) ye = LCD_H - y0;
-    for (int y = ys; y < ye; ++y)
-        for (int x = xs; x < xe; ++x) {
-            int s = (y * bm->width + x) * 4;
-            int d = ((y + y0) * LCD_W + x + x0) * 4;
-            memcpy(lcd + d, bm->map + s, 4);
-        }
-}
+        int dx = lx - last_down_x, dy = ly - last_down_y;
+        int dist2 = dx * dx + dy * dy;
+        int moved = dist2 > TOUCH_LOCK_DIST * TOUCH_LOCK_DIST;
 
-void font_show(char *s, int size, int w, int h, int bg, int fx, int fy,
-               int fg, int lx, int ly) {
-    bitmap *bm;
-    if (!g_font) g_font = fontLoad("/simfang.ttf");
-    if (!g_font) return;
-    fontSetSize(g_font, size);
-    bm = createBitmapWithInit(w, h, 4, bg);
-    if (!bm) return;
-    fontPrint(g_font, bm, fx, fy, s, fg, 0);
-    showbitmap(bm, lx, ly);
-    destroyBitmap(bm);
-}
-
-/* ================= 总首页 ================= */
-void start(void) {
-    int x, y;
-    show_24bmp("bj.bmp", 0, 0);
-    draw_group_info();
-    usleep(4000000);
-    get_xy(&x, &y);
-    while (1) { get_xy(&x, &y); if (x > 20 && x < 780 && y > 20 && y < 460) break; }
-}
-
-/* ================= 启动进度条 ================= */
-static void loading(void) {
-    int fd_lcd;
-    show_24bmp("1010.bmp", 0, 0);
-    unsigned char *fb = fb_mmap(&fd_lcd);
-    if (!fb) return;
-    fill_rect(fb, 100, 420, 600, 24, 0xFF323232u);
-    for (int i = 0; i <= 600; i += 4) {
-        fill_rect(fb, 100, 420, i, 24, 0xFF00C800u);
-        usleep(15000);
-    }
-    fb_unmap(fb, fd_lcd);
-}
-
-/* ================= 主界面（四个图标 + 文字） ================= */
-void page_main(int sockfd) {
-    int x, y;
-    while (1) {
-        show_24bmp("xbj.bmp", 0, 0);
-
-        /* 四个模块图标 225x135，严格对齐原始坐标 */
-        show_24bmp("xc.bmp",  80, 130);
-        show_24bmp("yy.bmp", 420, 130);
-        show_24bmp("lyb.bmp", 80, 330);
-        show_24bmp("dg.bmp", 420, 330);
-
-        /* 图标上叠加文字标签 */
-        font_show("相册",     32, 120, 40, 0x00000000, 10, 5, 0xFFFFFFFF, 130, 140);
-        font_show("语音控制", 32, 120, 40, 0x00000000, 10, 5, 0xFFFFFFFF, 470, 140);
-        font_show("留言器",   32, 120, 40, 0x00000000, 10, 5, 0xFFFFFFFF, 130, 340);
-        font_show("灯光控制", 32, 120, 40, 0x00000000, 10, 5, 0xFFFFFFFF, 470, 340);
-
-        /* 左上角首页按钮 */
-        fill_rect(lcd, 10, 10, 80, 40, 0xFF555555u);
-        font_show("首页", 24, 60, 30, 0x00000000, 5, 5, 0xFFFFFFFF, 15, 15);
-
-        read_touch(&x, &y);
-
-        if (in(x, y, 80, 130, 305, 265)) {
-            lock_touch(x, y); gallery_run();
-        } else if (in(x, y, 420, 130, 645, 265)) {
-            lock_touch(x, y); ai_voice(sockfd);
-        } else if (in(x, y, 80, 330, 305, 465)) {
-            lock_touch(x, y); recorder_run();
-        } else if (in(x, y, 420, 330, 645, 465)) {
-            lock_touch(x, y); light_run();
-        } else if (in(x, y, 10, 10, 90, 50)) {
+        if (moved || now - last_down_ms > TOUCH_JITTER_MS)
+        {
+            *x = lx, *y = ly;
+            last_down_x = last_down_y = -1;
             return;
         }
     }
 }
 
-/* ================= 相册 ================= */
-void gallery_run(void) {
-    int i = 0, x, y;
-    static const int next_rect[4] = {680, 410, 780, 460};
-    for (;;) {
-        show_24bmp("ybj.bmp", 0, 0);
-        show_24bmp(pics[i], 0, 0);
-        draw_back();
-        font_show("下一张", 24, 100, 40, 0xFF00AA00, 10, 8, 0xFFFFFFFF, 680, 420);
-        int r = wait_tap(1, next_rect, &x, &y);
-        if (r == -1) return;
-        if (r == 0) {
-            lock_touch(x, y);
-            i = (i + 1) % PIC_N;
-        }
+static int in_rect(int x, int y, int l, int t, int r, int b)
+{
+    return x >= l && x <= r && y >= t && y <= b;
+}
+
+// ================== 图片资源 ==================
+typedef struct
+{
+    const char *name;
+    const char *file;
+    int x, y, w, h;
+} card_t;
+
+// 主界面四个功能入口
+static card_t cards[] = {
+    {"相册",     "home/xc.bmp",  80,  130, 200, 150},
+    {"语音控制", "home/yy.bmp",  410, 130, 200, 150},
+    {"留言器",   "home/lyb.bmp", 80,  320, 200, 150},
+    {"灯光控制", "home/dsk.bmp", 410, 320, 200, 150},
+};
+#define NCARD (sizeof(cards) / sizeof(cards[0]))
+
+// 相册页图片
+static const char *photos[] = {"home/0720.bmp", "home/07.bmp", "home/06.bmp", "home/10.bmp"};
+#define NPHOTO (sizeof(photos) / sizeof(photos[0]))
+
+// ================== BMP 解码 ==================
+/*
+ * 自写 24 位 BMP 解码器
+ *   厂商例程里的解码函数对 24 位图支持不全，这里自己实现：
+ *   - 只处理 24 位 BMP：逐像素 BGR -> ARGB
+ *   - 每行字节数按 4 字节对齐补齐
+ *   - BMP 自下而上存储，写帧缓冲时垂直翻转，并处理 x0/y0 偏移
+ *   - 超出屏幕的部分自动裁剪
+ * 返回 0 成功，-1 失败。
+ */
+static int show_24bmp(const char *file, int x0, int y0)
+{
+    FILE *fp = fopen(file, "rb");
+    if (!fp)
+    {
+        perror("打开 BMP 失败");
+        return -1;
     }
-}
 
-/* ================= 留言器 ================= */
-void recorder_run(void) {
-    static const int mic[4] = {250, 330, 550, 460};
-    int ret, x, y;
-    (void)mic;
-    show_24bmp("ybj.bmp", 0, 0);
-    font_show("留言器", 32, 200, 50, 0xFF444444, 10, 10, 0xFFFFFFFF, 320, 60);
-    draw_back();
-    font_show("点击麦克风录制/播放", 28, 700, 40, 0xFFFFFFFF, 10, 8, 0xFF000000, 50, 130);
-    for (;;) {
-        int r = wait_tap(1, mic, &x, &y);
-        if (r < 0) return;
-        font_show("录音中...", 28, 700, 40, 0xFFFFFFFF, 10, 8, 0xFF000000, 50, 180);
-        ret = system(REC_WAV_CMD);
-        font_show(ret ? "录音失败" : "录音完成，点击播放", 28, 700, 40, 0xFFFFFFFF, 10, 8, 0xFF000000, 50, 180);
-        if (ret) continue;
-        for (;;) {
-            r = wait_tap(1, mic, &x, &y);
-            if (r < 0) return;
-            if (r == 0) break;
-        }
-        font_show("播放中...", 28, 700, 40, 0xFFFFFFFF, 10, 8, 0xFF000000, 50, 180);
-        system(PLAY_WAV_CMD);
-        font_show("播放完成", 28, 700, 40, 0xFFFFFFFF, 10, 8, 0xFF000000, 50, 180);
+    unsigned char hdr[54];
+    if (fread(hdr, 1, sizeof(hdr), fp) != sizeof(hdr))
+    {
+        fclose(fp);
+        return -1;
     }
-}
 
-/* ================= 灯光控制 ================= */
-static void led_text(int i) {
-    static const int xpos[] = {100, 340, 580};
-    static const unsigned int col[] = {0xFFFF0000, 0xFF00FF00, 0xFF0000FF};
-    char s[16];
-    snprintf(s, sizeof(s), "%s:%s", i == 0 ? "红" : i == 1 ? "绿" : "蓝", led[i] ? "开" : "关");
-    font_show(s, 24, 120, 50, led[i] ? (int)col[i] : (int)0xFF555555u, 10, 10, 0xFFFFFFFF, xpos[i], 240);
-}
-
-void light_run(void) {
-    static const int led_rects[3][4] = {
-        {100, 230, 240, 310},
-        {340, 230, 480, 310},
-        {580, 230, 720, 310}
-    };
-    int x, y;
-    show_24bmp("ybj.bmp", 0, 0);
-    font_show("灯光控制", 32, 200, 50, 0xFF444444, 10, 10, 0xFFFFFFFF, 300, 60);
-    draw_back();
-    for (int i = 0; i < 3; ++i) led_text(i);
-    for (;;) {
-        int r = wait_tap(3, (const int *)led_rects, &x, &y);
-        if (r < 0) return;
-        if (r < 3) { lock_touch(x, y); send_led(r, !led[r]); led_text(r); }
+    if (!(hdr[0] == 'B' && hdr[1] == 'M'))
+    {
+        fclose(fp);
+        return -1;
     }
-}
 
-/* ================= 语音控制 ================= */
-static void voice_page(void) {
-    show_24bmp("ybj.bmp", 0, 0);
-    draw_back();
-    font_show("点击麦克风开始语音控制", 28, 700, 40, 0xFFFFFFFF, 10, 8, 0xFF000000, 50, 130);
-}
+    int width  = hdr[18] | (hdr[19] << 8) | (hdr[20] << 16) | (hdr[21] << 24);
+    int height = hdr[22] | (hdr[23] << 8) | (hdr[24] << 16) | (hdr[25] << 24);
+    unsigned short depth = hdr[28] | (hdr[29] << 8);
 
-void ai_voice(int sockfd) {
-    static const int mic[4] = {300, 340, 520, 460};
-    int cmd, value, x, y;
-    char s[128];
-    (void)x; (void)y;
-    voice_page();
-    for (;;) {
-        int r = wait_tap(1, mic, &x, &y);
-        if (r < 0) return;
-        cmd = get_voice_info(sockfd);
-        if (cmd == 999) return;
-        if (cmd == 2) {
-            font_show("你好!", 32, 700, 300, 0xFFFFFF00, 10, 80, 0xFF000000, 36, 26);
-            system("aplay -q /ai_wav/nihao.wav &");
-        } else if (cmd == 3 || cmd == 6) {
-            font_show("请把手放到传感器，等待一会", 32, 700, 300, 0xFFFFFF00, 10, 80, 0xFF000000, 36, 26);
-            if (cmd == 3) {
-                system("aplay -q /ai_wav/dengdai.wav");
-                value = get_stm32_data("mks-sbp\n");
-                snprintf(s, sizeof(s), value <= 0 ? "测量失败，请重试" : value <= 139 ? "血压正常，继续保持" : "血压偏高，请注意");
-            } else {
-                value = get_stm32_data("mks-hr\n");
-                snprintf(s, sizeof(s), value > 0 ? "心率：%d" : "测量失败，请重试", value);
-            }
-            font_show(s, 32, 700, 300, 0xFFFFFF00, 10, 80, 0xFF000000, 36, 26);
-        } else if (cmd == 100) {
-            value = send_led(0, 1) && send_led(1, 1) && send_led(2, 1);
-            font_show(value ? "灯光已全部打开" : "灯光控制失败", 32, 700, 300, 0xFFFFFF00, 10, 80, 0xFF000000, 36, 26);
-        }else if (cmd == 4) {   // ★ 打开相册：进入相册循环，点返回后回到语音界面
-            font_show("好的，打开相册", 32, 700, 300, 0xFFFFFF00, 10, 80, 0xFF000000, 36, 26);
-            gallery_run();        // 阻塞在相册内，return 后回到本循环的下一轮等待语音
-        } else if (cmd == 5) {   // ★ 打开留言板
-            font_show("好的，打开留言板", 32, 700, 300, 0xFFFFFF00, 10, 80, 0xFF000000, 36, 26);
-            recorder_run();
-        }
-        else {
-            font_show("我好像没听懂，请再说一遍", 32, 700, 300, 0xFFFFFF00, 10, 80, 0xFF000000, 36, 26);
-        }
+    if (depth != 24)
+    {
+        printf("抱歉，该功能暂不支持。\n");
+        fclose(fp);
+        return -1;
     }
-}
 
-/* ================= 串口 / 网络 ================= */
-void serial_init(void) {
-    tty2_fd = open(DEV_PATH2, O_RDWR | O_NOCTTY);
-    if (tty2_fd < 0) exit(1);
-    init_tty(tty2_fd);
-}
+    int line_bytes = width * 3;
+    int line_bytes_vaild = (((line_bytes * 8) + 31) / 32) * 4;
+    int line_bytes_offset = line_bytes_vaild - line_bytes;
+    int total_line_bytes = (line_bytes + line_bytes_offset) * height;
 
-int get_stm32_data(char *cmd) {
-    if (strstr(cmd, "mks-sbp")) return stm_query(cmd, 0);
-    if (strstr(cmd, "mks-hr"))  return stm_query(cmd, 0);
-    if (strstr(cmd, "asm"))     return stm_query(cmd, 32);
+    unsigned char *data = (unsigned char *)malloc(total_line_bytes);
+    fread(data, total_line_bytes, 1, fp);
+
+    unsigned char r, g, b;
+    unsigned char *p = data;
+
+    for (int h = height - 1; h >= 0; h--)
+    {
+        for (int w = 0; w < width; w++)
+        {
+            b = *(p++);
+            g = *(p++);
+            r = *(p++);
+
+            int x1 = x0 + w;
+            int y1 = y0 + height - 1 - h;
+
+            if (x1 < 0 || y1 < 0 || x1 >= W || y1 >= H)
+                continue;
+
+            unsigned char *q = lcd + (y1 * W + x1) * 4;
+            q[0] = b;
+            q[1] = g;
+            q[2] = r;
+            q[3] = 255;
+        }
+        p += line_bytes_offset;
+    }
+
+    free(data);
+    fclose(fp);
     return 0;
 }
 
-int get_voice_info(int sockfd) {
-    xmlChar *id;
-    int n;
-    font_show("我在听，请说出你的需求", 32, 700, 300, 0xFFFFFF00, 10, 80, 0xFF000000, 36, 26);
-    if (system(REC_CMD)) return 0;
-    send_pcm(sockfd, "./cmd.pcm");
-    id = wait4id(sockfd);
-    if (!id) return 0;
-    n = atoi((char *)id);
-    xmlFree(id);
-    return n;
+/* ---- 全屏图片：文件缺失时画占位背景，便于排查 ---- */
+static int show_image_full(const char *file)
+{
+    struct stat st;
+    if (stat(file, &st) != 0)
+    {
+        draw_solid_rect(0, 0, W, H, 0xFF202020);
+        draw_text_center(file, 20, W / 2, H / 2, 0xFFFF0000);
+        return -1;
+    }
+    return show_24bmp(file, 0, 0);
 }
 
-/* ================= main ================= */
-int main(int argc, char **argv) {
-    int sockfd;
-    if (argc != 2) { printf("Usage: %s <ubuntu-IP>\n", argv[0]); return 1; }
+/* ---- 卡片缩略图 ---- */
+static int show_image_at(const char *file, int x, int y, int w, int h)
+{
+    struct stat st;
+    if (stat(file, &st) != 0)
+    {
+        draw_solid_rect(x, y, w, h, 0xFF303030);
+        draw_frame(x, y, w, h, 0xFFFFFFFF);
+        draw_text_center(file, 16, x + w / 2, y + h / 2 - 10, 0xFFFF0000);
+        return -1;
+    }
+    draw_solid_rect(x, y, w, h, 0xFF101010);
+    return show_24bmp(file, x, y);
+}
+
+// ================== 欢迎页 ==================
+static void draw_group_info(void)
+{
+    fontSetSize(f, 36);
+    show_font(f, "小卷", 0xFFFFFFFF, 20, 20);
+    draw_text_left("智能家居中控系统", 24, 20, 70, 0xFFAAAAAA);
+    draw_hline(0, 110, W, 0xFF555555);
+}
+
+void start(void)
+{
+    draw_solid_rect(0, 0, W, H, 0xFF000000);
+    show_image_full("bj.bmp");
+    draw_group_info();
+    draw_text_center("点击任意位置继续", 28, W / 2, H - 60, 0xFFFFFF00);
+    int x, y;
+    read_touch(&x, &y);
+}
+
+// ================== 开机动画 ==================
+static void loading(void)
+{
+    // 直接 mmap /dev/fb0 绘制进度条
+    int fd_lcd = open("/dev/fb0", O_RDWR);
+    if (fd_lcd < 0)
+    {
+        perror("打开 /dev/fb0 失败");
+        return;
+    }
+    unsigned char *fb = (unsigned char *)mmap(NULL, W * H * 4, PROT_READ | PROT_WRITE,
+                                              MAP_SHARED, fd_lcd, 0);
+    if (fb == MAP_FAILED)
+    {
+        perror("mmap 失败");
+        close(fd_lcd);
+        return;
+    }
+    draw_solid_rect(0, 0, W, H, 0xFF000000);
+    for (int i = 0; i <= 100; i += 5)
+    {
+        draw_progress(150, H / 2 - 10, W - 300, 20, i, 0xFF333333, 0xFF00CC66);
+        msleep(30);
+    }
+    draw_text_center("加载完成！", 28, W / 2, H / 2 - 60, 0xFFFFFFFF);
+    msleep(300);
+
+    munmap(fb, W * H * 4);
+    close(fd_lcd);
+}
+
+// ================== 页面枚举 ==================
+enum
+{
+    PAGE_MAIN = 0,
+    PAGE_GALLERY,
+    PAGE_VOICE,
+    PAGE_RECORDER,
+    PAGE_LIGHT
+};
+
+void gallery(void)
+{
+    int index = 0;
+    int x, y;
+    while (1)
+    {
+        draw_solid_rect(0, 0, W, H, 0xFF000000);
+        show_image_full(photos[index]);
+        draw_solid_rect(0, H - 80, W, 80, 0x80000000);
+        draw_text_left("下一张", 28, 20, H - 60, 0xFFFFFFFF);
+        draw_text_left("返回", 28, W - 100, H - 60, 0xFFFFFFFF);
+
+        read_touch(&x, &y);
+        if (y >= H - 80)
+        {
+            if (x < 200)
+            {
+                index = (index + 1) % NPHOTO;
+            }
+            else if (x > W - 200)
+            {
+                return;
+            }
+        }
+    }
+}
+
+void recorder(void)
+{
+    draw_solid_rect(0, 0, W, H, 0xFF000000);
+    draw_group_info();
+    draw_text_center("留言器", 36, W / 2, 40, 0xFFFFFF00);
+    draw_text_center("点击任意位置开始录音（5 秒）", 24, W / 2, H / 2 - 40, 0xFFFFFFFF);
+    int x, y;
+    read_touch(&x, &y);
+
+    if (system(CMD) < 0)
+        perror("system failed");
+
+    draw_solid_rect(0, 0, W, H, 0xFF000000);
+    draw_text_center("留言已保存", 36, W / 2, H / 2, 0xFF00FF00);
+    msleep(500);
+    if (system(CMD1) < 0)
+        perror("system failed");
+}
+
+void light(void)
+{
+    static int led_states[3] = {0, 0, 0};
+    int x, y;
+    while (1)
+    {
+        draw_solid_rect(0, 0, W, H, 0xFF000000);
+        draw_group_info();
+        draw_text_center("灯光控制", 36, W / 2, 40, 0xFFFFFF00);
+
+        const char *labels[] = {"灯 1", "灯 2", "灯 3"};
+        unsigned int colors[] = {0xFFFF0000, 0xFF00FF00, 0xFF0000FF};
+        int w = 200, h = 150;
+        int gap = 50;
+        int total = 3 * w + 2 * gap;
+        int start_x = (W - total) / 2;
+
+        for (int i = 0; i < 3; i++)
+        {
+            int x0 = start_x + i * (w + gap);
+            int y0 = 180;
+            draw_solid_rect(x0, y0, w, h, led_states[i] ? colors[i] : 0xFF333333);
+            draw_frame(x0, y0, w, h, 0xFFFFFFFF);
+            draw_text_center(labels[i], 28, x0 + w / 2, y0 + h / 2 - 15, 0xFFFFFFFF);
+        }
+
+        draw_solid_rect(0, H - 80, W, 80, 0x80000000);
+        draw_text_left("返回", 28, W - 100, H - 60, 0xFFFFFFFF);
+
+        read_touch(&x, &y);
+        if (y >= H - 80 && x > W - 200)
+            return;
+
+        for (int i = 0; i < 3; i++)
+        {
+            int x0 = start_x + i * (w + gap);
+            if (in_rect(x, y, x0, 180, x0 + w, 180 + h))
+            {
+                led_states[i] = !led_states[i];
+                char buf[128];
+                snprintf(buf, sizeof(buf), "led%d-%s\n", i + 1,
+                         led_states[i] ? "on" : "off");
+                int fd = open("/dev/ttySAC2", O_RDWR);
+                if (fd < 0)
+                {
+                    perror("打开串口失败");
+                    continue;
+                }
+                write(fd, buf, strlen(buf));
+                close(fd);
+            }
+        }
+    }
+}
+
+void voice(int sockfd)
+{
+    draw_solid_rect(0, 0, W, H, 0xFF000000);
+    draw_group_info();
+    draw_text_center("语音控制", 36, W / 2, 40, 0xFFFFFF00);
+    char hint[64];
+    snprintf(hint, sizeof(hint), "socketfd = %d", sockfd);
+    draw_text_left(hint, 20, 20, H - 30, 0xFF888888);
+
+    // 画个麦克风当按钮
+    int w = 200, h = 200;
+    int x0 = W / 2 - w / 2, y0 = 190;
+    draw_frame(x0, y0, w, h, 0xFFFFFF00);
+    draw_text_center("🎤", 64, W / 2, y0 + 60, 0xFFFFFFFF);
+    draw_text_center("点击开始说话", 24, W / 2, y0 + h - 40, 0xFFFFFFFF);
+
+    int x, y;
+    read_touch(&x, &y);
+    if (!in_rect(x, y, x0, y0, x0 + w, y0 + h))
+        return;
+
+    if (get_voice_info(sockfd) < 0)
+        return;
+
+    draw_solid_rect(0, 160, W, H - 160, 0xFF000000);
+    draw_text_center("识别中…", 32, W / 2, H / 2, 0xFFFFFF00);
+
+    xmlChar *id = wait4id(sockfd);
+    if (!id)
+    {
+        draw_text_center("未识别", 32, W / 2, H / 2, 0xFFFF0000);
+        msleep(1000);
+        return;
+    }
+
+    draw_solid_rect(0, 160, W, H - 160, 0xFF000000);
+    if (strcmp((char *)id, "2") == 0)
+    {
+        draw_text_center("你好！", 48, W / 2, H / 2, 0xFFFFFF00);
+    }
+    else if (strcmp((char *)id, "3") == 0)
+    { // 测量血压
+        draw_text_center("正在测量血压…", 32, W / 2, H / 2, 0xFFFFFF00);
+        int bp = stm_query("mks-sbp", 1);
+        char buf[64];
+        if (bp > 0)
+            snprintf(buf, sizeof(buf), "血压：%d mmHg", bp);
+        else
+            snprintf(buf, sizeof(buf), "测量失败，请再试一次");
+        draw_solid_rect(0, 160, W, H - 160, 0xFF000000);
+        draw_text_center(buf, 36, W / 2, H / 2, 0xFFFFFFFF);
+    }
+    else if (strcmp((char *)id, "6") == 0)
+    { // 测量心率
+        draw_text_center("正在测量心率…", 32, W / 2, H / 2, 0xFFFFFF00);
+        int hr = stm_query("mks-hr", 1);
+        char buf[64];
+        if (hr > 0)
+            snprintf(buf, sizeof(buf), "心率：%d bpm", hr);
+        else
+            snprintf(buf, sizeof(buf), "测量失败，请再试一次");
+        draw_solid_rect(0, 160, W, H - 160, 0xFF000000);
+        draw_text_center(buf, 36, W / 2, H / 2, 0xFFFFFFFF);
+    }
+    else if (strcmp((char *)id, "4") == 0)
+    { // 打开相册
+        gallery();
+        return;
+    }
+    else if (strcmp((char *)id, "5") == 0)
+    { // 打开留言器
+        recorder();
+        return;
+    }
+    else if (strcmp((char *)id, "100") == 0)
+    { // 打开全部灯光
+        static char cmd[128];
+        snprintf(cmd, sizeof(cmd), "led1-on\nled2-on\nled3-on\n");
+        stm_send(cmd);
+        draw_text_center("灯光已全部打开！", 36, W / 2, H / 2, 0xFFFFFF00);
+    }
+    else
+    {
+        draw_text_center("抱歉，我好像没听懂，请再说一遍", 28, W / 2, H / 2, 0xFFFF0000);
+    }
+    msleep(1500);
+}
+
+// ================== 主界面 ==================
+// 返回值：下一个要跳转的页面
+static int page_main(int sockfd)
+{
+    draw_solid_rect(0, 0, W, H, 0xFF000000);
+    show_image_full("bj2.bmp");
+    draw_group_info();
+
+    char buf[128];
+    snprintf(buf, sizeof(buf), "socketfd = %d", sockfd);
+    draw_text_left(buf, 18, 20, H - 25, 0xFF666666);
+
+    for (int i = 0; i < NCARD; i++)
+    {
+        int x = cards[i].x, y = cards[i].y, w = cards[i].w, h = cards[i].h;
+        show_image_at(cards[i].file, x, y, w, h);
+        draw_solid_rect(x, y + h - 30, w, 30, 0x80000000);
+        draw_text_center(cards[i].name, 20, x + w / 2, y + h - 26, 0xFFFFFFFF);
+    }
+
+    int x, y;
+    read_touch(&x, &y);
+    for (int i = 0; i < NCARD; i++)
+    {
+        int x0 = cards[i].x, y0 = cards[i].y;
+        if (in_rect(x, y, x0, y0, x0 + cards[i].w, y0 + cards[i].h))
+        {
+            return i + 1; // PAGE_GALLERY = 1
+        }
+    }
+    return PAGE_MAIN;
+}
+
+// ================== 串口 ==================
+#define TTY_DEV  "/dev/ttySAC2"
+#define TTY_BAUD 9600
+static int tty_fd = -1;
+
+void serial_init()
+{
+    tty_fd = init_tty(TTY_DEV);
+    if (tty_fd < 0)
+        printf("open error tty_fd!\n");
+
+    char *send_buf = "A";
+    write(tty_fd, send_buf, strlen(send_buf));
+    return;
+}
+
+// 发送 \n 结尾的命令
+static void stm_send(const char *cmd)
+{
+    if (tty_fd < 0)
+        return;
+    write(tty_fd, cmd, strlen(cmd));
+    fsync(tty_fd);
+}
+
+// 轮询等待 STM32 回一个整数，wait_secs 秒超时返回 -1
+static int stm_query(const char *cmd, int wait_secs)
+{
+    if (tty_fd < 0)
+        return -1;
+
+    write(tty_fd, cmd, strlen(cmd));
+
+    // 清空 pending
+    char ch;
+    while (read(tty_fd, &ch, 1) > 0)
+    {
+    };
+
+    // 串口可能分批给出数据，用缓冲累计，遇到数字或换行即成帧
+    char buf[64];
+    size_t idx = 0;
+    for (int waited = 0; waited < wait_secs * 1000 / 200; ++waited)
+    {
+        struct pollfd pfd = {.fd = tty_fd, .events = POLLIN};
+        if (poll(&pfd, 1, 200) > 0 && (pfd.revents & POLLIN))
+        {
+            ssize_t n = read(tty_fd, &ch, 1);
+            if (n <= 0)
+                continue;
+            if ((ch >= '0' && ch <= '9') || ch == '-')
+            {
+                if (idx + 1 < sizeof(buf))
+                    buf[idx++] = ch;
+                if (idx >= 2)
+                {
+                    buf[idx] = '\0';
+                    return atoi(buf);
+                }
+            }
+            else if (ch == '\n' || ch == '\r')
+            {
+                if (idx > 0)
+                {
+                    buf[idx] = '\0';
+                    return atoi(buf);
+                }
+            }
+        }
+    }
+    return -1;
+}
+
+/* ======================== main ======================== */
+int main(int argc, char **argv)
+{
+    serial_init();
+    if (argc < 2)
+    {
+        fprintf(stderr, "用法: %s <ubuntu-IP>\n", argv[0]);
+        return 1;
+    }
+    int sockfd = init_sock(argv[1]);
     lcd_init();
     ts_init();
-    serial_init();
-    sockfd = init_sock(argv[1]);
-    while (1) {
-        start();
-        loading();
-        page_main(sockfd);
+
+    // 开机：欢迎页 → 加载动画
+    start();
+    loading();
+
+    // 主循环：主页 + 四个功能页
+    int page = PAGE_MAIN;
+    for (;;)
+    {
+        switch (page)
+        {
+        case PAGE_MAIN:
+            page = page_main(sockfd);
+            break;
+        case PAGE_GALLERY:
+            gallery();
+            page = PAGE_MAIN;
+            break;
+        case PAGE_VOICE:
+            voice(sockfd);
+            page = PAGE_MAIN;
+            break;
+        case PAGE_RECORDER:
+            recorder();
+            page = PAGE_MAIN;
+            break;
+        case PAGE_LIGHT:
+            light();
+            page = PAGE_MAIN;
+            break;
+        default:
+            page = PAGE_MAIN;
+            break;
+        }
     }
-    close(sockfd);
-    close(tty2_fd);
-    if (g_font) fontUnload(g_font);
     return 0;
 }
