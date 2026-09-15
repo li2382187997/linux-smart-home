@@ -1,0 +1,25 @@
+# 实训方 BSP（版权归属实训方，不随仓库分发）
+common.c
+common.h
+
+# 运行期资源
+*.bmp
+*.pcm
+*.wav
+*.ttf
+
+# 交叉编译产物
+*.o
+*.a
+*.so
+app
+a.out
+build/
+out/
+
+# 系统与编辑器
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
