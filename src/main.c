@@ -139,7 +139,7 @@ static void fill_rect(unsigned char *fb, int x, int y, int w, int h, unsigned in
 
 /* ================= 组名信息（首页左上方） ================= */
 static void draw_group_info(void) {
-    font_show("李雅洁", 36, 200, 50, 0x00000000, 10, 5, 0xFFFFFFFF, 20, 20);
+    font_show("小卷", 36, 200, 50, 0x00000000, 10, 5, 0xFFFFFFFF, 20, 20);
    
 }
 
